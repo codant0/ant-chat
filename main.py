@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.checkpoint.memory import MemorySaver, InMemorySaver
 from langgraph.graph import StateGraph, MessagesState
 from langgraph.graph.state import CompiledStateGraph
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from models.llms import init_llm
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 PORT = 8012
 graph : CompiledStateGraph
+client : Anthropic
 LLM_TYPE = "minimax"
 MODEL = "MiniMax-M2.7"
 # 无用户系统，固定user_id
@@ -42,13 +44,35 @@ class ChatResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     content: str
 
-def chatbot(state: MessagesState, client: Anthropic) -> dict:
-    return {"messages": [client.messages.create(
+def chatbot(state: MessagesState) -> dict:
+    global client
+    # 将 LangChain 消息对象转换为 Anthropic API 格式的字典
+    messages = []
+    for msg in state["messages"]:
+        if hasattr(msg, "type"):
+            # LangChain 消息对象
+            role = "user" if msg.type == "human" else ("assistant" if msg.type == "ai" else msg.type)
+            content = msg.content if hasattr(msg, "content") else str(msg)
+        else:
+            # 已经是字典
+            role = msg.get("role")
+            content = msg.get("content")
+        messages.append({"role": role, "content": content})
+
+    response = client.messages.create(
         model=MODEL,
         max_tokens=1024,
-        # TODO 验证anthropic API当前调用正确
-        messages=state["messages"]
-    )]}
+        messages=messages
+    )
+    # 从响应中提取文本内容
+    response_text = ""
+    for block in response.content:
+        if hasattr(block, 'text') and block.text:
+            response_text += block.text
+        elif hasattr(block, 'type') and block.type == 'text':
+            response_text += block.text
+    # 将 Anthropic 响应转换为 LangChain AIMessage
+    return {"messages": [AIMessage(content=response_text)]}
 
 def create_graph(client: Anthropic) -> StateGraph:
     try:
@@ -104,7 +128,7 @@ def format_response(response):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global graph
+    global graph, client
 
     try:
         logger.info("Initing llm......")
@@ -132,8 +156,15 @@ def chat(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Init program not finished")
 
     try:
-        # 获取本次提问文本内容
-        user_input = request.messages[-1].content
+        # 转换消息格式
+        input_messages = []
+        for msg in request.messages:
+            if msg.role == "user":
+                input_messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                input_messages.append(AIMessage(content=msg.content))
+            elif msg.role == "system":
+                input_messages.append(SystemMessage(content=msg.content))
 
         # 设置用户线程信息
         config = {"configurable": {
@@ -146,20 +177,48 @@ def chat(request: ChatRequest):
         # 流式输出
         if request.is_stream:
             def generate_stream():
-                for chunk in graph.stream(input=user_input, checkpointer=checkpointer, config=config, stream_mode="messages"):
-                    # 处理messages mode 的流式输出块
-                    yield f"data: {chunk.content}"
+                global client
+                # 将 LangChain 消息对象转换为 Anthropic API 格式的字典
+                api_messages = []
+                for msg in input_messages:
+                    if hasattr(msg, "type"):
+                        role = "user" if msg.type == "human" else ("assistant" if msg.type == "ai" else msg.type)
+                        content = msg.content if hasattr(msg, "content") else str(msg)
+                    else:
+                        role = msg.get("role")
+                        content = msg.get("content")
+                    api_messages.append({"role": role, "content": content})
+
+                # 使用 LLM 的流式模式
+                with client.messages.stream(
+                    model=MODEL,
+                    max_tokens=1024,
+                    messages=api_messages
+                ) as stream:
+                    for event in stream:
+                        if hasattr(event, 'type'):
+                            if event.type == "content_block_delta":
+                                if hasattr(event, 'delta') and hasattr(event.delta, 'text'):
+                                    # 对文本进行base64编码，避免data:冲突
+                                    import base64
+                                    encoded = base64.b64encode(event.delta.text.encode('utf-8')).decode('ascii')
+                                    yield f"data: {encoded}\n\n"
+                            elif event.type == "message_delta":
+                                pass
                 # 流式输出结束信号
-                yield "data: __END_SIGNAL__"
+                yield "data: [DONE]\n\n"
             # 返回fastapi.responses中StreamingResponse对象
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
         # 非流式输出
-        result = graph.invoke(input=user_input, checkpointer=checkpointer, config=config)
+        result = graph.invoke(input={"messages": input_messages}, checkpointer=checkpointer, config=config)
+        # 从结果中提取最后一条助手消息的内容
+        assistant_message = result.get("messages", [])[-1] if result.get("messages") else ""
+        response_text = assistant_message.content if hasattr(assistant_message, 'content') else str(assistant_message)
         response = ChatResponse(
-            content=format_response(result),
+            content=format_response(response_text),
         )
-        return JSONResponse(response)
+        return JSONResponse(response.model_dump())
     except Exception as e:
         raise
 

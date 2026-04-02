@@ -78,19 +78,31 @@ def call_chat_api(messages: list, is_stream: bool) -> dict:
 
 
 def handle_stream_response(response):
-    """处理流式响应"""
+    """处理流式响应 - 打字机效果"""
+    import base64
+    import time
     message_placeholder = st.empty()
     full_response = ""
 
     for line in response.iter_lines(decode_unicode=True):
+        line = line.strip()
         if line.startswith("data: "):
             data = line[6:]
-            if data == "__END_SIGNAL__":
+            if data == "[DONE]":
                 break
-            full_response += data
-            message_placeholder.markdown(format_response(full_response) + "▌")
+            try:
+                # 解码base64编码的文本
+                decoded = base64.b64decode(data.encode('ascii')).decode('utf-8')
+            except Exception:
+                decoded = data
 
-    message_placeholder.markdown(format_response(full_response))
+            # 逐字显示，形成打字机效果
+            for char in decoded:
+                full_response += char
+                message_placeholder.markdown(full_response + "▌")
+                time.sleep(0.01)  # 打字速度，可调整
+
+    message_placeholder.markdown(full_response)
     return full_response
 
 
