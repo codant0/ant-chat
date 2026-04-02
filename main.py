@@ -1,20 +1,30 @@
 import logging
+import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import List
 
+import uvicorn
 from anthropic import Anthropic
-from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from langgraph.checkpoint.memory import MemorySaver, InMemorySaver
 from langgraph.graph import StateGraph, MessagesState
+from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, Field
+
+from models.llms import init_llm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 PORT = 8012
-graph = None
-model = "MiniMax-M2.7"
+graph : CompiledStateGraph
+LLM_TYPE = "minimax"
+MODEL = "MiniMax-M2.7"
+# 无用户系统，固定user_id
+USER_ID = "user_1"
 
 class Message(BaseModel):
     role: str
@@ -30,16 +40,17 @@ class ChatResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"ant-chat-{uuid.uuid4().hex}")
     object: str = "ant-chat"
     created: int = Field(default_factory=lambda: int(time.time()))
+    content: str
 
 def chatbot(state: MessagesState, client: Anthropic) -> dict:
     return {"messages": [client.messages.create(
-        model=model,
+        model=MODEL,
         max_tokens=1024,
         # TODO 验证anthropic API当前调用正确
-        messages=[{"role": "user", "content": "Hello!"}]
+        messages=state["messages"]
     )]}
 
-def create_graph(agent: Anthropic) -> StateGraph:
+def create_graph(client: Anthropic) -> StateGraph:
     try:
         graph = StateGraph(MessagesState)
 
@@ -91,3 +102,69 @@ def format_response(response):
     # 将所有格式化后的段落用两个换行符连接起来，以形成一个具有清晰段落分隔的文本
     return '\n\n'.join(formatted_paragraphs)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global graph
+
+    try:
+        logger.info("Initing llm......")
+        client = init_llm(llm_type=LLM_TYPE)
+        graph = create_graph(client)
+        save_graph_visualization(graph)
+        logger.info("Success to init llm")
+    except Exception as e:
+        logger.error(f"Failed to init llm: {str(e)}")
+        raise
+
+    # yield 关键字将控制权交还给FastAPI框架，使应用开始运行
+    yield
+    # 关闭时执行
+    logger.info("Closing.........")
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/v1/chat")
+def chat(request: ChatRequest):
+    global graph
+    # 初始化未完成
+    if not graph:
+        logger.error("Init program not finished.")
+        raise HTTPException(status_code=400, detail="Init program not finished")
+
+    try:
+        # 获取本次提问文本内容
+        user_input = request.messages[-1].content
+
+        # 设置用户线程信息
+        config = {"configurable": {
+            "thread_id": USER_ID + request.conversation_id
+        }}
+
+        # 设置短期记忆
+        checkpointer = InMemorySaver()
+
+        # 流式输出
+        if request.is_stream:
+            def generate_stream():
+                for chunk in graph.stream(input=user_input, checkpointer=checkpointer, config=config, stream_mode="messages"):
+                    # 处理messages mode 的流式输出块
+                    yield f"data: {chunk.content}"
+                # 流式输出结束信号
+                yield "data: __END_SIGNAL__"
+            # 返回fastapi.responses中StreamingResponse对象
+            return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+        # 非流式输出
+        result = graph.invoke(input=user_input, checkpointer=checkpointer, config=config)
+        response = ChatResponse(
+            content=format_response(result),
+        )
+        return JSONResponse(response)
+    except Exception as e:
+        raise
+
+if __name__ == "__main__":
+    logger.info(f"在端口 {PORT} 上启动服务器")
+    # uvicorn是一个用于运行ASGI应用的轻量级、超快速的ASGI服务器实现
+    # 用于部署基于FastAPI框架的异步PythonWeb应用程序
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
