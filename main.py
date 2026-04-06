@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import time
 import uuid
@@ -7,18 +8,24 @@ from typing import List
 
 import uvicorn
 from anthropic import Anthropic
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from langgraph.checkpoint.memory import MemorySaver, InMemorySaver
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.memory import InMemoryStore
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import StateGraph, MessagesState
 from langgraph.graph.state import CompiledStateGraph
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.store.postgres import PostgresStore
 from pydantic import BaseModel, Field
 
 from models.llms import init_llm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 PORT = 8012
 graph : CompiledStateGraph
@@ -27,6 +34,8 @@ LLM_TYPE = "minimax"
 MODEL = "MiniMax-M2.7"
 # 无用户系统，固定user_id
 USER_ID = "user_1"
+# 本地postgresql数据库，暂不加密
+DB_URI = "postgresql://postgres:postgres@192.168.1.9:38933/postgres?sslmode=disable"
 
 class Message(BaseModel):
     role: str
@@ -74,7 +83,7 @@ def chatbot(state: MessagesState) -> dict:
     # 将 Anthropic 响应转换为 LangChain AIMessage
     return {"messages": [AIMessage(content=response_text)]}
 
-def create_graph(client: Anthropic) -> StateGraph:
+def create_graph() -> CompiledStateGraph:
     try:
         graph = StateGraph(MessagesState)
 
@@ -82,8 +91,26 @@ def create_graph(client: Anthropic) -> StateGraph:
         graph.set_entry_point("chatbot")
         graph.set_finish_point("chatbot")
 
-        checkpointer = MemorySaver()
+        # 基于内存的短期记忆，进程重启后丢失
+        # checkpointer = MemorySaver()
+        # 基于Postgresql的短期记忆
+        user = os.getenv("DB_USER")
+        password = os.getenv("DB_PASSWORD")
+        host = os.getenv("DB_HOST")
+        port = os.getenv("DB_PORT")
+        dbname = os.getenv("DB_NAME")
+        db_uri = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+        with PostgresSaver.from_conn_string(db_uri) as checkpointer:
+            # 首次使用时，需要初始化相关表
+            checkpointer.setup()
+
+        # 基于内存的长期记忆，进程重启后丢失
+        # store = InMemoryStore()
+        # 基于Postgresql的长期记忆
+        # PostgresStore.from_conn_string(DB_URI)
+
         return graph.compile(checkpointer=checkpointer)
+        # return graph.compile(checkpointer=checkpointer, store=store)
 
     except Exception as e:
         logger.error(f"Failed to create graph: {str(e)}")
@@ -133,7 +160,7 @@ async def lifespan(app: FastAPI):
     try:
         logger.info("Initing llm......")
         client = init_llm(llm_type=LLM_TYPE)
-        graph = create_graph(client)
+        graph = create_graph()
         save_graph_visualization(graph)
         logger.info("Success to init llm")
     except Exception as e:
@@ -166,13 +193,10 @@ def chat(request: ChatRequest):
             elif msg.role == "system":
                 input_messages.append(SystemMessage(content=msg.content))
 
-        # 设置用户线程信息
+        # 设置用户线程信息（配置短期记忆）
         config = {"configurable": {
             "thread_id": USER_ID + request.conversation_id
         }}
-
-        # 设置短期记忆
-        checkpointer = InMemorySaver()
 
         # 流式输出
         if request.is_stream:
@@ -211,7 +235,7 @@ def chat(request: ChatRequest):
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
         # 非流式输出
-        result = graph.invoke(input={"messages": input_messages}, checkpointer=checkpointer, config=config)
+        result = graph.invoke(input={"messages": input_messages}, config=config)
         # 从结果中提取最后一条助手消息的内容
         assistant_message = result.get("messages", [])[-1] if result.get("messages") else ""
         response_text = assistant_message.content if hasattr(assistant_message, 'content') else str(assistant_message)
