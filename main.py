@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg import Connection
+from psycopg.rows import dict_row
 from langgraph.graph import StateGraph, MessagesState
 from langgraph.graph.state import CompiledStateGraph
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -34,8 +36,6 @@ LLM_TYPE = "minimax"
 MODEL = "MiniMax-M2.7"
 # 无用户系统，固定user_id
 USER_ID = "user_1"
-# 本地postgresql数据库，暂不加密
-DB_URI = "postgresql://postgres:postgres@192.168.1.9:38933/postgres?sslmode=disable"
 
 class Message(BaseModel):
     role: str
@@ -100,16 +100,16 @@ def create_graph() -> CompiledStateGraph:
         port = os.getenv("DB_PORT")
         dbname = os.getenv("DB_NAME")
         db_uri = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
-        with PostgresSaver.from_conn_string(db_uri) as checkpointer:
-            # 首次使用时，需要初始化相关表
-            checkpointer.setup()
+        conn = Connection.connect(db_uri, autocommit=True, prepare_threshold=0, row_factory=dict_row)
+        checkpointer = PostgresSaver(conn)
+        checkpointer.setup()
 
         # 基于内存的长期记忆，进程重启后丢失
         # store = InMemoryStore()
         # 基于Postgresql的长期记忆
-        # PostgresStore.from_conn_string(DB_URI)
+        store = PostgresStore(conn)
 
-        return graph.compile(checkpointer=checkpointer)
+        return graph.compile(checkpointer=checkpointer, store=store)
         # return graph.compile(checkpointer=checkpointer, store=store)
 
     except Exception as e:
