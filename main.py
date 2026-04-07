@@ -11,8 +11,6 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg import Connection
 from psycopg.rows import dict_row
@@ -100,14 +98,16 @@ def create_graph() -> CompiledStateGraph:
         port = os.getenv("DB_PORT")
         dbname = os.getenv("DB_NAME")
         db_uri = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
-        conn = Connection.connect(db_uri, autocommit=True, prepare_threshold=0, row_factory=dict_row)
-        checkpointer = PostgresSaver(conn)
+        checkpointerConn = Connection.connect(db_uri, autocommit=True, prepare_threshold=0, row_factory=dict_row)
+        checkpointer = PostgresSaver(checkpointerConn)
         checkpointer.setup()
 
         # 基于内存的长期记忆，进程重启后丢失
         # store = InMemoryStore()
         # 基于Postgresql的长期记忆
-        store = PostgresStore(conn)
+        storeConn = Connection.connect(db_uri, autocommit=True, prepare_threshold=0, row_factory=dict_row)
+        store = PostgresStore(storeConn)
+        store.setup()
 
         return graph.compile(checkpointer=checkpointer, store=store)
         # return graph.compile(checkpointer=checkpointer, store=store)
