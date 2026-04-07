@@ -8,9 +8,10 @@ import streamlit as st
 import uuid
 from datetime import datetime
 
+from models.user import render_username_modal, get_current_user
+
 # 配置
 API_BASE_URL = "http://localhost:8012"
-DEFAULT_USER_ID = "user_1"
 
 # 页面配置
 st.set_page_config(
@@ -18,6 +19,13 @@ st.set_page_config(
     page_icon="💬",
     layout="centered"
 )
+
+# 渲染聊天界面标题（作为弹窗背景）
+st.title("💬 Ant Chat")
+
+# 用户初始化检查（模态弹窗）
+if not render_username_modal():
+    st.stop()
 
 # 初始化会话状态
 if "conversation_id" not in st.session_state:
@@ -50,10 +58,11 @@ def format_response(response: str) -> str:
 
 def call_chat_api(messages: list, is_stream: bool) -> dict:
     """调用聊天API"""
+    current_user = get_current_user()
     payload = {
         "messages": messages,
         "is_stream": is_stream,
-        "user_id": DEFAULT_USER_ID,
+        "user_id": current_user["user_id"],
         "conversation_id": st.session_state.conversation_id
     }
 
@@ -116,6 +125,9 @@ def handle_non_stream_response(response):
 with st.sidebar:
     st.title("设置")
 
+    current_user = get_current_user()
+    st.markdown(f"**用户**: {current_user['username']}")
+
     if st.button("开启新对话"):
         st.session_state.conversation_id = str(uuid.uuid4())
         st.session_state.messages = []
@@ -130,9 +142,6 @@ with st.sidebar:
     if st.button("清空历史消息"):
         st.session_state.messages = []
         st.rerun()
-
-# 主聊天界面
-st.title("💬 Ant Chat")
 
 # 显示聊天历史
 for message in st.session_state.messages:

@@ -16,7 +16,8 @@
 ant-chat/
 ├── main.py              # FastAPI 后端核心，/v1/chat 接口
 ├── models/
-│   └── llms.py         # LLM 初始化，支持 MiniMax / GLM / Ollama
+│   ├── llms.py         # LLM 初始化，支持 MiniMax / GLM / Ollama
+│   └── user.py        # 用户模块
 ├── web/
 │   └── chatbot_ui.py  # Streamlit 前端聊天界面
 ├── test_chat.py        # 非流式对话测试
@@ -24,6 +25,23 @@ ant-chat/
 ├── graph.png           # LangGraph 工作流可视化（自动生成）
 ├── .env                # 环境变量配置
 └── .env_template       # 环境变量模板
+```
+
+## 前置准备
+
+### 安装 pgvector 插件
+
+本项目使用 PostgreSQL + pgvector 作为向量数据库，需要先安装 pgvector 扩展：
+
+```bash
+# 安装pgvector
+git clone --branch v0.6.0 https://github.com/pgvector/pgvector.git
+cd pgvector
+make
+make install
+
+# 启用扩展
+CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
 ## 快速启动
@@ -83,11 +101,15 @@ streamlit run web/chatbot_ui.py
 - [x] 流式输出（SSE + 打字机效果）
 - [x] LangGraph 工作流可视化（graph.png）
 - [x] Streamlit 前端 UI（支持开启新对话、清空历史）
+- [x] 极简用户模块（首次访问输入用户名，相同用户名识别为同一用户）
 
 ## 待实现功能
 
-- [ ] 基于 PostgreSQL + pgvector 的长期记忆
+- [ ] 基于 PostgreSQL + pgvector 的长期记忆（简易，后续考虑引入框架，如MemU）
+- [ ] 独立会话功能及会话历史记录
+- [ ] 长期记忆框架 + 可选长期、短期记忆存储方案（默认本地保存）
 - [ ] RAG（检索增强生成）
+- [ ] 上下文压缩
 - [ ] 多 Agent 任务协同
 
 ## 注意事项

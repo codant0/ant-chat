@@ -32,8 +32,6 @@ graph : CompiledStateGraph
 client : Anthropic
 LLM_TYPE = "minimax"
 MODEL = "MiniMax-M2.7"
-# 无用户系统，固定user_id
-USER_ID = "user_1"
 
 class Message(BaseModel):
     role: str
@@ -195,7 +193,7 @@ def chat(request: ChatRequest):
 
         # 设置用户线程信息（配置短期记忆）
         config = {"configurable": {
-            "thread_id": USER_ID + request.conversation_id
+            "thread_id": request.user_id + request.conversation_id
         }}
 
         # 流式输出
