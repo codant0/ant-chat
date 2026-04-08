@@ -26,7 +26,7 @@ def init_user_state():
 def render_username_modal() -> bool:
     """
     渲染用户名输入弹窗
-    使用自定义 HTML/CSS 实现居中弹窗 + 轻微模糊背景
+    使用自定义 HTML/CSS 实现居中弹窗
     """
     init_user_state()
 
@@ -34,19 +34,11 @@ def render_username_modal() -> bool:
     if st.session_state.user_initialized:
         return True
 
-    # CSS - 轻微模糊背景
+    # CSS - 隐藏默认页面元素
     st.markdown("""
     <style>
-    /* 隐藏默认页面元素 */
     #MainMenu {visibility: hidden !important;}
     header {visibility: hidden !important;}
-
-    /* 背景模糊 */
-    [data-testid="stMainBlock"] {
-        background: rgba(0, 0, 0, 0.08) !important;
-        backdrop-filter: blur(2px);
-        -webkit-backdrop-filter: blur(2px);
-    }
     </style>
     """, unsafe_allow_html=True)
 

@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 import re
@@ -21,6 +22,19 @@ from langgraph.store.postgres import PostgresStore
 from pydantic import BaseModel, Field
 
 from models.llms import init_llm
+from models.conversation import (
+    init_conversations_table,
+    create_conversation,
+    get_conversations_by_user_id,
+    get_conversation_by_id,
+    update_conversation_name,
+    delete_conversation,
+    generate_conversation_name,
+    ConversationCreate,
+    ConversationUpdate,
+    ConversationResponse,
+    ConversationListResponse,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -108,7 +122,6 @@ def create_graph() -> CompiledStateGraph:
         store.setup()
 
         return graph.compile(checkpointer=checkpointer, store=store)
-        # return graph.compile(checkpointer=checkpointer, store=store)
 
     except Exception as e:
         logger.error(f"Failed to create graph: {str(e)}")
@@ -156,13 +169,15 @@ async def lifespan(app: FastAPI):
     global graph, client
 
     try:
+        logger.info("Initializing conversations table......")
+        init_conversations_table()
         logger.info("Initing llm......")
         client = init_llm(llm_type=LLM_TYPE)
         graph = create_graph()
         save_graph_visualization(graph)
         logger.info("Success to init llm")
     except Exception as e:
-        logger.error(f"Failed to init llm: {str(e)}")
+        logger.error(f"Failed to init: {str(e)}")
         raise
 
     # yield 关键字将控制权交还给FastAPI框架，使应用开始运行
@@ -172,6 +187,99 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+# ============ 对话历史 API ============
+
+@app.get("/v1/conversations", response_model=ConversationListResponse)
+def list_conversations(user_id: str):
+    """
+    获取用户的所有对话列表
+
+    Args:
+        user_id: 用户 ID
+
+    Returns:
+        对话列表
+    """
+    try:
+        conversations = get_conversations_by_user_id(user_id)
+        return ConversationListResponse(conversations=conversations)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to list conversations: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve conversations")
+
+
+@app.post("/v1/conversations", response_model=ConversationResponse, status_code=201)
+def new_conversation(conversation: ConversationCreate):
+    """
+    创建新对话
+
+    Args:
+        conversation: 对话创建请求
+
+    Returns:
+        创建的对话
+    """
+    try:
+        return create_conversation(conversation)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create conversation: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create conversation")
+
+
+@app.delete("/v1/conversations/{conversation_id}")
+def remove_conversation(conversation_id: str):
+    """
+    删除对话（逻辑删除）
+
+    Args:
+        conversation_id: 对话 ID
+
+    Returns:
+        是否删除成功
+    """
+    try:
+        success = delete_conversation(conversation_id)
+        if success:
+            return {"message": "Conversation deleted successfully"}
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete conversation {conversation_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete conversation")
+
+
+@app.patch("/v1/conversations/{conversation_id}", response_model=ConversationResponse)
+def rename_conversation(conversation_id: str, update: ConversationUpdate):
+    """
+    更新对话名称
+
+    Args:
+        conversation_id: 对话 ID
+        update: 更新内容
+
+    Returns:
+        更新后的对话
+    """
+    try:
+        # 检查对话是否存在
+        existing = get_conversation_by_id(conversation_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        return update_conversation_name(conversation_id, update.conversation_name)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update conversation {conversation_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update conversation")
+
+
 @app.post("/v1/chat")
 def chat(request: ChatRequest):
     global graph
@@ -180,69 +288,74 @@ def chat(request: ChatRequest):
         logger.error("Init program not finished.")
         raise HTTPException(status_code=400, detail="Init program not finished")
 
+    # 自动命名逻辑：对话历史操作失败不影响聊天主流程
     try:
-        # 转换消息格式
-        input_messages = []
-        for msg in request.messages:
-            if msg.role == "user":
-                input_messages.append(HumanMessage(content=msg.content))
-            elif msg.role == "assistant":
-                input_messages.append(AIMessage(content=msg.content))
-            elif msg.role == "system":
-                input_messages.append(SystemMessage(content=msg.content))
-
-        # 设置用户线程信息（配置短期记忆）
-        config = {"configurable": {
-            "thread_id": request.user_id + request.conversation_id
-        }}
-
-        # 流式输出
-        if request.is_stream:
-            def generate_stream():
-                global client
-                # 将 LangChain 消息对象转换为 Anthropic API 格式的字典
-                api_messages = []
-                for msg in input_messages:
-                    if hasattr(msg, "type"):
-                        role = "user" if msg.type == "human" else ("assistant" if msg.type == "ai" else msg.type)
-                        content = msg.content if hasattr(msg, "content") else str(msg)
-                    else:
-                        role = msg.get("role")
-                        content = msg.get("content")
-                    api_messages.append({"role": role, "content": content})
-
-                # 使用 LLM 的流式模式
-                with client.messages.stream(
-                    model=MODEL,
-                    max_tokens=1024,
-                    messages=api_messages
-                ) as stream:
-                    for event in stream:
-                        if hasattr(event, 'type'):
-                            if event.type == "content_block_delta":
-                                if hasattr(event, 'delta') and hasattr(event.delta, 'text'):
-                                    # 对文本进行base64编码，避免data:冲突
-                                    import base64
-                                    encoded = base64.b64encode(event.delta.text.encode('utf-8')).decode('ascii')
-                                    yield f"data: {encoded}\n\n"
-                            elif event.type == "message_delta":
-                                pass
-                # 流式输出结束信号
-                yield "data: [DONE]\n\n"
-            # 返回fastapi.responses中StreamingResponse对象
-            return StreamingResponse(generate_stream(), media_type="text/event-stream")
-
-        # 非流式输出
-        result = graph.invoke(input={"messages": input_messages}, config=config)
-        # 从结果中提取最后一条助手消息的内容
-        assistant_message = result.get("messages", [])[-1] if result.get("messages") else ""
-        response_text = assistant_message.content if hasattr(assistant_message, 'content') else str(assistant_message)
-        response = ChatResponse(
-            content=format_response(response_text),
-        )
-        return JSONResponse(response.model_dump())
+        conversation = get_conversation_by_id(request.conversation_id)
+        if conversation and not conversation.conversation_name:
+            first_user_msg = next(
+                (msg.content for msg in request.messages if msg.role == "user"),
+                None
+            )
+            if first_user_msg:
+                auto_name = generate_conversation_name(first_user_msg)
+                update_conversation_name(request.conversation_id, auto_name)
+                logger.info(f"Auto-named conversation {request.conversation_id}: {auto_name}")
     except Exception as e:
-        raise
+        logger.warning(f"Failed to auto-name conversation {request.conversation_id}: {str(e)}", exc_info=True)
+
+    # 转换消息格式
+    input_messages = []
+    for msg in request.messages:
+        if msg.role == "user":
+            input_messages.append(HumanMessage(content=msg.content))
+        elif msg.role == "assistant":
+            input_messages.append(AIMessage(content=msg.content))
+        elif msg.role == "system":
+            input_messages.append(SystemMessage(content=msg.content))
+
+    # 设置用户线程信息（配置短期记忆）
+    config = {"configurable": {
+        "thread_id": request.user_id + request.conversation_id
+    }}
+
+    # 流式输出
+    if request.is_stream:
+        def generate_stream():
+            global client
+            api_messages = []
+            for msg in input_messages:
+                if hasattr(msg, "type"):
+                    role = "user" if msg.type == "human" else ("assistant" if msg.type == "ai" else msg.type)
+                    content = msg.content if hasattr(msg, "content") else str(msg)
+                else:
+                    role = msg.get("role")
+                    content = msg.get("content")
+                api_messages.append({"role": role, "content": content})
+
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=1024,
+                messages=api_messages
+            ) as stream:
+                for event in stream:
+                    if hasattr(event, 'type'):
+                        if event.type == "content_block_delta":
+                            if hasattr(event, 'delta') and hasattr(event.delta, 'text'):
+                                encoded = base64.b64encode(event.delta.text.encode('utf-8')).decode('ascii')
+                                yield f"data: {encoded}\n\n"
+                        elif event.type == "message_delta":
+                            pass
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+    # 非流式输出
+    result = graph.invoke(input={"messages": input_messages}, config=config)
+    assistant_message = result.get("messages", [])[-1] if result.get("messages") else ""
+    response_text = assistant_message.content if hasattr(assistant_message, 'content') else str(assistant_message)
+    response = ChatResponse(
+        content=format_response(response_text),
+    )
+    return JSONResponse(response.model_dump())
 
 if __name__ == "__main__":
     logger.info(f"在端口 {PORT} 上启动服务器")
