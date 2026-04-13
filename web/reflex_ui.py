@@ -71,11 +71,24 @@ class State(rx.State):
         if username:
             self.username = username
             self.user_id = self.get_user_id(username)
+            self.conversations = self.get_conversations_api()
             self.user_initialized = True
             self.conversation_id = ""  # 不创建默认对话，等用户发消息时再创建
-            self.conversations = []
             self.messages = []
-    
+
+    def get_messages_api(self, conversation_id: str) -> List[Dict]:
+        """获取对话的消息历史"""
+        import requests
+        try:
+            response = requests.get(
+                f"http://localhost:8012/v1/conversations/{conversation_id}/messages",
+                timeout=10
+            )
+            response.raise_for_status()
+            return response.json().get("messages", [])
+        except Exception:
+            return []
+
     # ===== API 调用 =====
     
     def get_conversations_api(self) -> List[Dict]:
@@ -141,29 +154,34 @@ class State(rx.State):
     
     def create_conversation(self):
         """创建新对话"""
-        self.conversation_id = str(uuid.uuid4())
-        self.conversations.insert(0, {
-            "id": self.conversation_id,
-            "conversation_name": "新对话"
-        })
+        new_conv = self.create_conversation_api("新对话")
+        if new_conv:
+            self.conversation_id = new_conv.get("id", str(uuid.uuid4()))
+            self.conversations = [new_conv] + self.conversations
+        else:
+            self.conversation_id = str(uuid.uuid4())
+            self.conversations.insert(0, {
+                "id": self.conversation_id,
+                "conversation_name": "新对话"
+            })
         self.messages = []
         self.editing_conversation_id = ""
     
     def switch_conversation(self, conversation_id: str):
         """切换对话"""
         self.conversation_id = conversation_id
-        self.messages = []
+        self.messages = self.get_messages_api(conversation_id)
         self.editing_conversation_id = ""
     
     def delete_conversation(self, conversation_id: str):
         """删除对话"""
         self.delete_conversation_api(conversation_id)
         self.conversations = [c for c in self.conversations if c["id"] != conversation_id]
-        
+
         if conversation_id == self.conversation_id:
             if self.conversations:
                 self.conversation_id = self.conversations[0]["id"]
-                self.messages = []
+                self.messages = self.get_messages_api(self.conversation_id)
             else:
                 self.create_conversation()
     
@@ -220,9 +238,9 @@ class State(rx.State):
         current_conv_exists = any(c["id"] == self.conversation_id for c in self.conversations)
 
         # 如果是对话列表中没有的对话，需要先创建
+        # 注意：传空名称让后端自动命名
         if not current_conv_exists or not self.conversation_id:
-            auto_name = self.generate_conversation_name(user_message)
-            new_conv = self.create_conversation_api(auto_name)
+            new_conv = self.create_conversation_api("")  # 传空名称，后端会自动命名
             if new_conv:
                 self.conversation_id = new_conv.get("id", str(uuid.uuid4()))
                 self.conversations = [new_conv] + self.conversations
@@ -284,6 +302,10 @@ class State(rx.State):
             # 最终更新
             self.streaming_content = ""
             self.messages = self.messages + [{"role": "assistant", "content": full_content}]
+
+            # 重新获取对话列表，确保左侧标题已更新为后端归纳的名称
+            yield
+            self.conversations = self.get_conversations_api()
         except Exception as e:
             print(f"请求失败: {e}")
             self.streaming_content = ""

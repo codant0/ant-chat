@@ -24,16 +24,21 @@ from pydantic import BaseModel, Field
 from models.llms import init_llm
 from models.conversation import (
     init_conversations_table,
+    init_messages_table,
     create_conversation,
     get_conversations_by_user_id,
     get_conversation_by_id,
     update_conversation_name,
     delete_conversation,
     generate_conversation_name,
+    create_message,
+    get_messages_by_conversation_id,
     ConversationCreate,
     ConversationUpdate,
     ConversationResponse,
     ConversationListResponse,
+    MessageResponse,
+    MessageListResponse,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -171,6 +176,8 @@ async def lifespan(app: FastAPI):
     try:
         logger.info("Initializing conversations table......")
         init_conversations_table()
+        logger.info("Initializing messages table......")
+        init_messages_table()
         logger.info("Initing llm......")
         client = init_llm(llm_type=LLM_TYPE)
         graph = create_graph()
@@ -280,6 +287,34 @@ def rename_conversation(conversation_id: str, update: ConversationUpdate):
         raise HTTPException(status_code=500, detail="Failed to update conversation")
 
 
+# ============ 消息历史 API ============
+
+@app.get("/v1/conversations/{conversation_id}/messages", response_model=MessageListResponse)
+def list_messages(conversation_id: str):
+    """
+    获取对话的所有消息
+
+    Args:
+        conversation_id: 对话 ID
+
+    Returns:
+        消息列表
+    """
+    try:
+        # 检查对话是否存在
+        existing = get_conversation_by_id(conversation_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        messages = get_messages_by_conversation_id(conversation_id)
+        return MessageListResponse(messages=messages)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to list messages: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve messages")
+
+
 @app.post("/v1/chat")
 def chat(request: ChatRequest):
     global graph
@@ -323,6 +358,16 @@ def chat(request: ChatRequest):
         def generate_stream():
             global client
             api_messages = []
+            full_response = ""
+
+            # 保存用户消息到数据库
+            try:
+                for msg in request.messages:
+                    if msg.role == "user":
+                        create_message(request.conversation_id, "user", msg.content)
+            except Exception as e:
+                logger.warning(f"Failed to save user message: {str(e)}")
+
             for msg in input_messages:
                 if hasattr(msg, "type"):
                     role = "user" if msg.type == "human" else ("assistant" if msg.type == "ai" else msg.type)
@@ -341,10 +386,19 @@ def chat(request: ChatRequest):
                     if hasattr(event, 'type'):
                         if event.type == "content_block_delta":
                             if hasattr(event, 'delta') and hasattr(event.delta, 'text'):
+                                full_response += event.delta.text
                                 encoded = base64.b64encode(event.delta.text.encode('utf-8')).decode('ascii')
                                 yield f"data: {encoded}\n\n"
                         elif event.type == "message_delta":
                             pass
+
+            # 保存 AI 回复到数据库
+            try:
+                if full_response:
+                    create_message(request.conversation_id, "assistant", full_response)
+            except Exception as e:
+                logger.warning(f"Failed to save assistant message: {str(e)}")
+
             yield "data: [DONE]\n\n"
         return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
@@ -352,6 +406,17 @@ def chat(request: ChatRequest):
     result = graph.invoke(input={"messages": input_messages}, config=config)
     assistant_message = result.get("messages", [])[-1] if result.get("messages") else ""
     response_text = assistant_message.content if hasattr(assistant_message, 'content') else str(assistant_message)
+
+    # 保存用户消息和 AI 回复到数据库
+    try:
+        for msg in request.messages:
+            if msg.role == "user":
+                create_message(request.conversation_id, "user", msg.content)
+        if response_text:
+            create_message(request.conversation_id, "assistant", response_text)
+    except Exception as e:
+        logger.warning(f"Failed to save messages: {str(e)}")
+
     response = ChatResponse(
         content=format_response(response_text),
     )

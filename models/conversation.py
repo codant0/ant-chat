@@ -50,6 +50,22 @@ class ConversationListResponse(BaseModel):
     conversations: List[ConversationResponse]
 
 
+# ============ 消息模型 ============
+
+class MessageResponse(BaseModel):
+    """消息响应模型"""
+    id: str
+    conversation_id: str
+    role: str  # "user" or "assistant"
+    content: str
+    created_at: datetime
+
+
+class MessageListResponse(BaseModel):
+    """消息列表响应模型"""
+    messages: List[MessageResponse]
+
+
 def get_db_connection():
     """获取数据库连接"""
     user = os.getenv("DB_USER")
@@ -89,6 +105,35 @@ def init_conversations_table():
         logger.info("Conversations table initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize conversations table: {str(e)}", exc_info=True)
+        raise
+
+
+def init_messages_table():
+    """初始化 messages 表"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        conversation_id UUID NOT NULL,
+                        role            VARCHAR(32) NOT NULL,
+                        content         TEXT NOT NULL,
+                        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
+                    ON messages(conversation_id);
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_messages_created_at
+                    ON messages(created_at ASC);
+                """)
+            conn.commit()
+        logger.info("Messages table initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize messages table: {str(e)}", exc_info=True)
         raise
 
 
@@ -281,3 +326,76 @@ def generate_conversation_name(first_question: str, max_length: int = 20) -> str
 
     # 去除尾部空白
     return truncated.strip()
+
+
+# ============ 消息相关函数 ============
+
+def create_message(conversation_id: str, role: str, content: str) -> MessageResponse:
+    """
+    创建新消息
+
+    Args:
+        conversation_id: 对话 ID
+        role: 角色 ("user" or "assistant")
+        content: 消息内容
+
+    Returns:
+        创建的消息响应
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO messages (conversation_id, role, content)
+                    VALUES (%s, %s, %s)
+                    RETURNING id, conversation_id, role, content, created_at
+                """, (conversation_id, role, content))
+                row = cur.fetchone()
+            conn.commit()
+
+        if row is None:
+            logger.error("Failed to create message: fetchone returned None")
+            raise Exception("Failed to create message: fetchone returned None")
+
+        # 转换 UUID 为字符串
+        row['id'] = str(row['id'])
+        row['conversation_id'] = str(row['conversation_id'])
+
+        logger.info(f"Created message: {row['id']} for conversation: {conversation_id}")
+        return MessageResponse(**row)
+    except Exception as e:
+        logger.error(f"Failed to create message: {str(e)}", exc_info=True)
+        raise
+
+
+def get_messages_by_conversation_id(conversation_id: str) -> List[MessageResponse]:
+    """
+    获取对话的所有消息（按创建时间升序）
+
+    Args:
+        conversation_id: 对话 ID
+
+    Returns:
+        消息列表
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, conversation_id, role, content, created_at
+                    FROM messages
+                    WHERE conversation_id = %s
+                    ORDER BY created_at ASC
+                """, (conversation_id,))
+                rows = cur.fetchall()
+
+        messages = []
+        for row in rows:
+            row['id'] = str(row['id'])
+            row['conversation_id'] = str(row['conversation_id'])
+            messages.append(MessageResponse(**row))
+        logger.info(f"Retrieved {len(messages)} messages for conversation: {conversation_id}")
+        return messages
+    except Exception as e:
+        logger.error(f"Failed to get messages for conversation {conversation_id}: {str(e)}", exc_info=True)
+        raise
