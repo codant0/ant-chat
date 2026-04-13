@@ -55,7 +55,9 @@ class State(rx.State):
     input_message: str = ""
     is_streaming: bool = True
     is_loading: bool = False
-    streaming_content: str = ""
+    is_pending: bool = False  # 显示pending状态
+    streaming_content: str = ""  # 流式输出的中间内容
+    pending_indicator: str = ""  # pending动画指示器
     
     # ===== 用户管理 =====
     
@@ -70,8 +72,8 @@ class State(rx.State):
             self.username = username
             self.user_id = self.get_user_id(username)
             self.user_initialized = True
-            self.conversation_id = str(uuid.uuid4())
-            self.conversations = [{"id": self.conversation_id, "conversation_name": "新对话"}]
+            self.conversation_id = ""  # 不创建默认对话，等用户发消息时再创建
+            self.conversations = []
             self.messages = []
     
     # ===== API 调用 =====
@@ -204,29 +206,38 @@ class State(rx.State):
         return truncated.strip()
     
     def send_message(self):
-        """发送消息"""
+        """发送消息 - 处理对话创建和AI回复"""
         if not self.input_message.strip():
             return
-        
+
+        import requests
+        import base64
+
         user_message = self.input_message.strip()
         self.input_message = ""
-        self.messages = self.messages + [{"role": "user", "content": user_message}]
-        
-        # 如果需要创建对话
-        if not self.conversation_id:
+
+        # 检查当前对话是否已存在于对话列表中
+        current_conv_exists = any(c["id"] == self.conversation_id for c in self.conversations)
+
+        # 如果是对话列表中没有的对话，需要先创建
+        if not current_conv_exists or not self.conversation_id:
             auto_name = self.generate_conversation_name(user_message)
             new_conv = self.create_conversation_api(auto_name)
             if new_conv:
                 self.conversation_id = new_conv.get("id", str(uuid.uuid4()))
                 self.conversations = [new_conv] + self.conversations
-        
-        self.is_loading = True
-    
-    async def stream_response(self):
-        """流式响应 - 打字机效果"""
-        import base64
-        import requests
-        
+            else:
+                self.conversation_id = str(uuid.uuid4())
+
+        # 添加用户消息
+        self.messages = self.messages + [{"role": "user", "content": user_message}]
+        self.is_pending = True
+        self.streaming_content = ""
+        self.pending_indicator = "⠋"
+
+        # yield 让UI更新，显示pending状态
+        yield
+
         try:
             response = requests.post(
                 "http://localhost:8012/v1/chat",
@@ -240,8 +251,13 @@ class State(rx.State):
                 timeout=120
             )
             response.raise_for_status()
-            
-            full_response = ""
+
+            full_content = ""
+            pending_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            pending_idx = 0
+            update_counter = 0
+
+            # 处理SSE流式响应
             for line in response.iter_lines(decode_unicode=True):
                 line = line.strip()
                 if line.startswith("data: "):
@@ -252,45 +268,29 @@ class State(rx.State):
                         decoded = base64.b64decode(data.encode('ascii')).decode('utf-8')
                     except Exception:
                         decoded = data
-                    
-                    full_response += decoded
-                    self.streaming_content = full_response
-                    yield
-            
-            self.messages = self.messages + [{"role": "assistant", "content": full_response}]
-            self.is_loading = False
+
+                    # 逐字符添加
+                    for char in decoded:
+                        full_content += char
+                        update_counter += 1
+                        # 每累积10个字符更新一次UI
+                        if update_counter >= 10:
+                            self.streaming_content = full_content + "▌"
+                            pending_idx = (pending_idx + 1) % len(pending_chars)
+                            self.pending_indicator = pending_chars[pending_idx]
+                            update_counter = 0
+                            yield
+
+            # 最终更新
             self.streaming_content = ""
-            
-        except Exception as e:
-            print(f"流式响应失败: {e}")
-            self.messages = self.messages + [{"role": "assistant", "content": f"抱歉，发生了错误: {str(e)}"}]
-            self.is_loading = False
-            self.streaming_content = ""
-    
-    def send_message_nonstream(self):
-        """非流式响应"""
-        import requests
-        
-        try:
-            response = requests.post(
-                "http://localhost:8012/v1/chat",
-                json={
-                    "messages": self.messages,
-                    "is_stream": False,
-                    "user_id": self.user_id,
-                    "conversation_id": self.conversation_id
-                },
-                timeout=120
-            )
-            response.raise_for_status()
-            result = response.json()
-            content = result.get("content", "")
-            self.messages = self.messages + [{"role": "assistant", "content": content}]
+            self.messages = self.messages + [{"role": "assistant", "content": full_content}]
         except Exception as e:
             print(f"请求失败: {e}")
+            self.streaming_content = ""
             self.messages = self.messages + [{"role": "assistant", "content": f"抱歉，发生了错误: {str(e)}"}]
         finally:
-            self.is_loading = False
+            self.is_pending = False
+            self.pending_indicator = ""
 
 
 # ============ UI 组件 ============
@@ -311,7 +311,7 @@ def render_username_modal() -> rx.Component:
             justify_content="center",
             z_index="1000",
         ),
-        # 弹窗内容
+        # 弹窗内容 - 使用flex居中
         rx.box(
             rx.heading(
                 "欢迎使用 Ant Chat",
@@ -332,6 +332,8 @@ def render_username_modal() -> rx.Component:
                     name="username",
                     max_length=20,
                     width="100%",
+                    height="48px",
+                    min_height="48px",
                     padding="12px 16px",
                     border_radius="8px",
                     border=f"1px solid {COLORS['border_light']}",
@@ -357,6 +359,11 @@ def render_username_modal() -> rx.Component:
             max_width="400px",
             width="90%",
             text_align="center",
+            position="fixed",
+            top="50%",
+            left="50%",
+            transform="translate(-50%, -50%)",
+            z_index="1001",
         ),
     )
 
@@ -372,13 +379,13 @@ def render_conversation_item(conv: Dict) -> rx.Component:
             rx.input(
                 value=State.editing_name,
                 on_change=State.set_editing_name,
-                size="sm",
+                size="1",
                 width="100%",
                 margin_bottom="4px",
             ),
             rx.hstack(
-                rx.button("保存", on_click=State.save_rename, size="sm", color_scheme="blue"),
-                rx.button("取消", on_click=State.cancel_rename, size="sm", variant="outline"),
+                rx.button("保存", on_click=State.save_rename, color_scheme="blue"),
+                rx.button("取消", on_click=State.cancel_rename, variant="outline"),
                 spacing="2",
             ),
             padding="8px",
@@ -484,7 +491,7 @@ def render_sidebar() -> rx.Component:
 def render_message(msg: Dict) -> rx.Component:
     """聊天消息"""
     is_user = msg["role"] == "user"
-    
+
     return rx.box(
         rx.text(
             msg["content"],
@@ -508,6 +515,54 @@ def render_message(msg: Dict) -> rx.Component:
     )
 
 
+def render_pending_indicator() -> rx.Component:
+    """Pending状态指示器 - AI正在输入"""
+    return rx.box(
+        rx.hstack(
+            rx.text(
+                State.pending_indicator,
+                font_size="16px",
+            ),
+            rx.text(
+                "AI正在思考...",
+                color=COLORS["text_light"],
+                font_size="14px",
+            ),
+            spacing="2",
+            align_items="center",
+        ),
+        background=COLORS["card_white"],
+        border_radius="18px 18px 18px 4px",
+        padding="12px 16px",
+        box_shadow="0 1px 4px rgba(0, 0, 0, 0.08)",
+        display="flex",
+        justify_content="flex-start",
+        width="100%",
+        margin_bottom="12px",
+    )
+
+
+def render_streaming_message() -> rx.Component:
+    """流式输出中的消息（打字机效果）"""
+    return rx.box(
+        rx.text(
+            State.streaming_content,
+            background=COLORS["card_white"],
+            color=COLORS["text_dark"],
+            border_radius="18px 18px 18px 4px",
+            padding="12px 16px",
+            max_width="70%",
+            box_shadow="0 1px 4px rgba(0, 0, 0, 0.08)",
+            white_space="pre-wrap",
+            word_wrap="break-word",
+        ),
+        display="flex",
+        justify_content="flex-start",
+        width="100%",
+        margin_bottom="12px",
+    )
+
+
 def render_chat_area() -> rx.Component:
     """主聊天区域"""
     # 获取当前对话名称
@@ -523,7 +578,7 @@ def render_chat_area() -> rx.Component:
         ),
         "新对话",
     )
-    
+
     return rx.box(
         # 顶部标题栏
         rx.box(
@@ -534,6 +589,14 @@ def render_chat_area() -> rx.Component:
                 font_weight="bold",
                 color=COLORS["primary_blue"],
             ),
+            rx.cond(
+                State.is_pending,
+                rx.text(
+                    " ●",  # 显示一个点表示AI正在处理
+                    color="orange",
+                    font_size="lg",
+                ),
+            ),
             padding="16px",
             border_bottom=f"1px solid {COLORS['border_light']}",
             background=COLORS["card_white"],
@@ -542,7 +605,24 @@ def render_chat_area() -> rx.Component:
         ),
         # 消息列表
         rx.box(
-            rx.foreach(State.messages, render_message),
+            rx.vstack(
+                rx.foreach(State.messages, render_message),
+                # Pending状态时显示正在输入指示器
+                rx.cond(
+                    State.is_pending,
+                    rx.cond(
+                        State.streaming_content == "",
+                        render_pending_indicator(),
+                    ),
+                ),
+                # 流式输出时显示打字机效果的消息
+                rx.cond(
+                    State.streaming_content != "",
+                    render_streaming_message(),
+                ),
+                spacing="0",
+                align_items="stretch",
+            ),
             flex="1",
             overflow_y="auto",
             padding="16px",
@@ -558,16 +638,23 @@ def render_chat_area() -> rx.Component:
                         placeholder="请输入您的问题...",
                         on_change=State.set_input_message,
                         flex="1",
+                        height="48px",
+                        min_height="48px",
                         padding="12px 16px",
                         border_radius="8px",
                         border=f"1px solid {COLORS['border_light']}",
                         background=COLORS["card_white"],
+                        disabled=State.is_pending,  # pending时禁用输入
                     ),
                     rx.button(
                         "发送",
                         type="submit",
                         padding="12px 24px",
-                        background=f"linear-gradient(135deg, {COLORS['primary_blue']}, {COLORS['light_blue']})",
+                        background=rx.cond(
+                            State.is_pending,
+                            "gray.400",
+                            f"linear-gradient(135deg, {COLORS['primary_blue']}, {COLORS['light_blue']})",
+                        ),
                         color="white",
                         border_radius="8px",
                         font_weight="500",
@@ -613,8 +700,5 @@ def index() -> rx.Component:
 # ============ 应用配置 ============
 
 app = rx.App(
-    title="Ant Chat",
-    theme=rx.Theme(
-        accent_color=COLORS["primary_blue"],
-    ),
+    theme=rx.theme(accent_color="blue"),
 )

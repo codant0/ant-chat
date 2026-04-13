@@ -1,2 +1,12 @@
+.idea
+.claude
+.env
+/.web/
+/ant_chat/
+/.states/
+/web/.states/
+
 __pycache__/
 *.pyc
+/start_fixed.bat
+/start_reflex.py
