@@ -4,10 +4,10 @@
 
 ## 技术栈
 
-- **框架**: FastAPI + LangGraph
+- **后端框架**: FastAPI + LangGraph
 - **LLM**: MiniMax (MiniMax-M2.7)、智谱 AI (glm-4)，兼容 Anthropic API 协议
 - **记忆**: PostgreSQL（通过 LangGraph PostgresSaver 实现短期记忆）
-- **前端**: Streamlit
+- **前端**: Reflex（基于 React Router v7 + Radix UI）
 - **数据库**: PostgreSQL + pgvector（规划中，用于 RAG 和长期记忆）
 
 ## 项目结构
@@ -17,14 +17,23 @@ ant-chat/
 ├── main.py              # FastAPI 后端核心，/v1/chat 接口
 ├── models/
 │   ├── llms.py         # LLM 初始化，支持 MiniMax / GLM / Ollama
-│   ├── user.py        # 用户模块
+│   ├── user.py         # 用户模块
 │   └── conversation.py # 对话历史模块
+├── ant_chat/
+│   └── ant_chat.py     # Reflex 后端状态和事件处理
 ├── web/
-│   └── chatbot_ui.py  # Streamlit 前端聊天界面
+│   ├── reflex_ui.py    # Reflex 前端 UI 定义
+│   └── chatbot_ui.py   # Streamlit 前端（已弃用）
+├── .web/               # Reflex 编译输出目录
+│   ├── app/           # React 组件和路由
+│   ├── utils/         # 工具函数和上下文
+│   └── components/    # UI 组件
 ├── test_chat.py        # 非流式对话测试
 ├── test_stream.py      # 流式对话测试
 ├── test_memory.py      # 记忆功能测试
 ├── graph.png           # LangGraph 工作流可视化（自动生成）
+├── rxconfig.py         # Reflex 配置
+├── start_reflex.py     # Reflex 启动脚本（自动修复编译问题）
 ├── .env                # 环境变量配置
 └── .env_template       # 环境变量模板
 ```
@@ -63,19 +72,21 @@ MINIMAX_API_KEY=your_minimax_api_key
 # 或 GLM_API_KEY=your_glm_api_key
 ```
 
-### 2. 启动后端服务
+### 2. 启动前后端服务
 
 ```bash
-python main.py
+python start_reflex.py
 ```
 
-服务将在 `http://localhost:8012` 启动。
-
-### 3. 启动前端 UI
+或直接使用 Reflex 命令：
 
 ```bash
-streamlit run web/chatbot_ui.py
+python -m reflex run
 ```
+
+服务启动后：
+- 前端: http://localhost:3000
+- 后端 API: http://localhost:8000
 
 ## API 接口
 
@@ -192,7 +203,7 @@ CREATE INDEX idx_conversations_created_at ON conversations(created_at DESC);
 - [x] 对话历史管理（对话默认命名、创建、查询、删除、重命名）
 - [x] 流式输出（SSE + 打字机效果）
 - [x] LangGraph 工作流可视化（graph.png）
-- [x] Streamlit 前端 UI（支持开启新对话、清空历史）
+- [x] Reflex 前端 UI（支持开启新对话、清空历史）
 - [x] 极简用户模块（首次访问输入用户名，相同用户名识别为同一用户）
 
 ## 待实现功能
@@ -208,3 +219,4 @@ CREATE INDEX idx_conversations_created_at ON conversations(created_at DESC);
 - 本项目为本地运行练习项目，**请勿直接部署到公网**
 - PostgreSQL 数据库暂未启用加密，请确保网络隔离
 - LLM 调用默认使用 `MiniMax-M2.7` 模型
+- 使用 `start_reflex.py` 启动可自动处理 Reflex 编译问题
