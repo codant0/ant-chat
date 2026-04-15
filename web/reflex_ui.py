@@ -151,12 +151,14 @@ class State(rx.State):
             return {"id": conversation_id, "conversation_name": new_name}
     
     # ===== 对话管理 =====
-    
+
     def create_conversation(self):
-        """创建新对话"""
+        """创建新对话（立即创建）"""
+        # 立即创建新对话，使用临时名称
         new_conv = self.create_conversation_api("新对话")
         if new_conv:
             self.conversation_id = new_conv.get("id", str(uuid.uuid4()))
+            new_conv["conversation_name"] = "新对话"
             self.conversations = [new_conv] + self.conversations
         else:
             self.conversation_id = str(uuid.uuid4())
@@ -238,14 +240,34 @@ class State(rx.State):
         current_conv_exists = any(c["id"] == self.conversation_id for c in self.conversations)
 
         # 如果是对话列表中没有的对话，需要先创建
-        # 注意：传空名称让后端自动命名
+        # 或者当前对话名称是"新对话"，需要更新为基于第一条消息的名称
         if not current_conv_exists or not self.conversation_id:
-            new_conv = self.create_conversation_api("")  # 传空名称，后端会自动命名
+            # 使用前端生成对话名称
+            conv_name = self.generate_conversation_name(user_message)
+            new_conv = self.create_conversation_api(conv_name)
             if new_conv:
                 self.conversation_id = new_conv.get("id", str(uuid.uuid4()))
+                # 更新返回的对话名称（后端可能进一步处理）
+                if new_conv.get("conversation_name"):
+                    conv_name = new_conv["conversation_name"]
+                # 确保使用最新的名称
+                new_conv["conversation_name"] = conv_name
                 self.conversations = [new_conv] + self.conversations
             else:
                 self.conversation_id = str(uuid.uuid4())
+                self.conversations.insert(0, {
+                    "id": self.conversation_id,
+                    "conversation_name": conv_name
+                })
+        elif current_conv_exists:
+            # 检查当前对话名称是否为"新对话"，如果是则更新
+            current_conv = next((c for c in self.conversations if c["id"] == self.conversation_id), None)
+            if current_conv and current_conv.get("conversation_name") == "新对话":
+                conv_name = self.generate_conversation_name(user_message)
+                # 更新本地列表中的名称
+                current_conv["conversation_name"] = conv_name
+                # 也在后端更新
+                self.rename_conversation_api(self.conversation_id, conv_name)
 
         # 添加用户消息
         self.messages = self.messages + [{"role": "user", "content": user_message}]
@@ -261,19 +283,29 @@ class State(rx.State):
                 "http://localhost:8012/v1/chat",
                 json={
                     "messages": self.messages,
-                    "is_stream": True,
+                    "is_stream": self.is_streaming,
                     "user_id": self.user_id,
                     "conversation_id": self.conversation_id
                 },
-                stream=True,
+                stream=self.is_streaming,
                 timeout=120
             )
             response.raise_for_status()
 
+            # 非流式响应处理
+            if not self.is_streaming:
+                result = response.json()
+                full_content = result.get("content", "")
+                self.streaming_content = ""
+                self.messages = self.messages + [{"role": "assistant", "content": full_content}]
+                self.conversations = self.get_conversations_api()
+                self.is_pending = False
+                self.pending_indicator = ""
+                return
+
             full_content = ""
             pending_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             pending_idx = 0
-            update_counter = 0
 
             # 处理SSE流式响应
             for line in response.iter_lines(decode_unicode=True):
@@ -287,19 +319,16 @@ class State(rx.State):
                     except Exception:
                         decoded = data
 
-                    # 逐字符添加
+                    # 逐字符添加并立即更新UI（打字机效果）
                     for char in decoded:
                         full_content += char
-                        update_counter += 1
-                        # 每累积10个字符更新一次UI
-                        if update_counter >= 10:
-                            self.streaming_content = full_content + "▌"
-                            pending_idx = (pending_idx + 1) % len(pending_chars)
-                            self.pending_indicator = pending_chars[pending_idx]
-                            update_counter = 0
-                            yield
+                        self.streaming_content = full_content + "▌"
+                        pending_idx = (pending_idx + 1) % len(pending_chars)
+                        self.pending_indicator = pending_chars[pending_idx]
+                        # 立即yield触发UI更新
+                        yield
 
-            # 最终更新
+            # 最终更新：移除光标并保存完整消息
             self.streaming_content = ""
             self.messages = self.messages + [{"role": "assistant", "content": full_content}]
 
@@ -436,14 +465,14 @@ def render_conversation_item(conv: Dict) -> rx.Component:
                 rx.button(
                     "✏️",
                     on_click=lambda: State.start_rename(conv["id"]),
-                    size="xs",
+                    size="1",
                     variant="ghost",
                     opacity=0.6,
                 ),
                 rx.button(
                     "🗑️",
                     on_click=lambda: State.delete_conversation(conv["id"]),
-                    size="xs",
+                    size="1",
                     variant="ghost",
                     color="red",
                     opacity=0.6,
@@ -478,7 +507,7 @@ def render_sidebar() -> rx.Component:
             "+ 新建对话",
             on_click=State.create_conversation,
             width="calc(100% - 32px)",
-            margin="16px",
+            margin="16px 16px 8px 16px",
             padding="12px",
             background=f"linear-gradient(135deg, {COLORS['primary_blue']}, {COLORS['light_blue']})",
             color="white",
@@ -486,12 +515,30 @@ def render_sidebar() -> rx.Component:
             font_weight="500",
             _hover={"transform": "translateY(-1px)", "box_shadow": "0 4px 12px rgba(0, 113, 188, 0.3)"},
         ),
+        # 流式输出开关
+        rx.box(
+            rx.hstack(
+                rx.text("流式输出", font_size="sm", color=COLORS["text_dark"]),
+                rx.switch(
+                    is_checked=State.is_streaming,
+                    on_change=State.set_is_streaming,
+                    color_scheme="blue",
+                ),
+                justify_content="space-between",
+                align_items="center",
+                width="100%",
+            ),
+            padding="8px 16px",
+        ),
         # 对话列表
         rx.box(
             rx.cond(
-                len(State.conversations) > 0,
+                State.conversations.length() > 0,
                 rx.vstack(
-                    *[render_conversation_item(conv) for conv in State.conversations[:10]],
+                    rx.foreach(
+                        State.conversations[:10],
+                        render_conversation_item,
+                    ),
                     spacing="2",
                 ),
                 rx.text("暂无对话记录", color="gray.500", font_size="sm", padding="16px"),
@@ -591,10 +638,10 @@ def render_chat_area() -> rx.Component:
     current_name = rx.cond(
         State.conversation_id != "",
         rx.cond(
-            len(State.conversations) > 0,
+            State.conversations.length() > 0,
             rx.foreach(
                 State.conversations,
-                lambda c: rx.cond(c["id"] == State.conversation_id, c["conversation_name"]),
+                lambda c: rx.cond(c["id"] == State.conversation_id, c["conversation_name"], ""),
             ),
             "新对话",
         ),
@@ -722,5 +769,10 @@ def index() -> rx.Component:
 # ============ 应用配置 ============
 
 app = rx.App(
-    theme=rx.theme(accent_color="blue"),
+    theme=rx.theme(
+        appearance="light",
+        has_background=True,
+        radius="large",
+        accent_color="blue",
+    ),
 )
